@@ -1,0 +1,13 @@
+services:
+  directory-submitter:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - directory_submitter_data:/app/data
+    shm_size: "1gb"
+
+volumes:
+  directory_submitter_data:

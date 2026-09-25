@@ -35,7 +35,7 @@ from uuid import uuid4
 import httpx
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, HttpUrl, field_validator
 from playwright.async_api import (
     Browser,
@@ -65,6 +65,7 @@ def resolve_path(value: str) -> Path:
 @dataclass(frozen=True)
 class Settings:
     telegram_bot_token: str
+    telegram_channel_id: str
     twocaptcha_api_key: str
     webhook_api_key: str
     dry_run: bool
@@ -80,8 +81,11 @@ class Settings:
 def load_settings() -> Settings:
     return Settings(
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
+        telegram_channel_id=os.getenv("TELEGRAM_CHANNEL_ID", "").strip(),
         twocaptcha_api_key=os.getenv("TWOCAPTCHA_API_KEY", "").strip(),
-        webhook_api_key=os.getenv("WEBHOOK_API_KEY", "").strip(),
+        webhook_api_key=os.getenv(
+            "WEBHOOK_SECRET", os.getenv("WEBHOOK_API_KEY", "")
+        ).strip(),
         dry_run=env_bool("DRY_RUN", True),
         headless=env_bool("HEADLESS", True),
         database_path=resolve_path(os.getenv("DATABASE_PATH", "data/jobs.sqlite3")),
@@ -107,7 +111,7 @@ class SubmissionPayload(BaseModel):
     description: str = Field(min_length=20, max_length=5_000)
     category: str = Field(min_length=2, max_length=200)
     contact_email: EmailStr
-    telegram_chat_id: str
+    telegram_chat_id: str = Field(default="", validate_default=True)
 
     # Opcionales: mejoran algunos formularios sin cambiar el contrato minimo.
     pricing_model: str = Field(default="Freemium", max_length=80)
@@ -118,8 +122,11 @@ class SubmissionPayload(BaseModel):
     @field_validator("telegram_chat_id")
     @classmethod
     def validate_chat_id(cls, value: str) -> str:
+        value = str(value or settings.telegram_channel_id).strip()
         if not re.fullmatch(r"-?\d+", value):
-            raise ValueError("telegram_chat_id debe ser numerico")
+            raise ValueError(
+                "telegram_chat_id debe ser numerico o TELEGRAM_CHANNEL_ID debe estar configurado"
+            )
         return value
 
 
@@ -1002,12 +1009,36 @@ async def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> No
 
 
 @app.get("/health")
-async def health() -> Dict[str, Any]:
+async def health(response: Response) -> Dict[str, Any]:
+    sqlite_ok = False
+    playwright_ok = False
+
+    try:
+        with sqlite3.connect(settings.database_path, timeout=5) as connection:
+            sqlite_ok = connection.execute("SELECT 1").fetchone() == (1,)
+    except sqlite3.Error:
+        sqlite_ok = False
+
+    try:
+        async with async_playwright() as playwright:
+            playwright_ok = Path(playwright.chromium.executable_path).is_file()
+    except PlaywrightError:
+        playwright_ok = False
+
+    ready = sqlite_ok and playwright_ok
+    if not ready:
+        response.status_code = 503
+
     return {
-        "status": "ok",
+        "status": "ok" if ready else "degraded",
         "queue_size": job_queue.qsize(),
         "dry_run": settings.dry_run,
         "directories": len(DIRECTORIES),
+        "checks": {
+            "fastapi": True,
+            "sqlite": sqlite_ok,
+            "playwright_chromium": playwright_ok,
+        },
     }
 
 

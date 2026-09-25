@@ -39,8 +39,9 @@ directorios cuyas condiciones permitan el envío automatizado.
 
    ```text
    TELEGRAM_BOT_TOKEN=...
+   TELEGRAM_CHANNEL_ID=1577307373
    TWOCAPTCHA_API_KEY=...
-   WEBHOOK_API_KEY=un_valor_largo_y_aleatorio
+   WEBHOOK_SECRET=un_valor_largo_y_aleatorio
    DRY_RUN=true
    ```
 
@@ -55,6 +56,9 @@ directorios cuyas condiciones permitan el envío automatizado.
    ```bash
    curl http://localhost:8000/health
    ```
+
+   La respuesta confirma por separado FastAPI, SQLite y la instalación de
+   Playwright/Chromium. Si alguno no está disponible, responde HTTP 503.
 
 4. Envía el payload de prueba:
 

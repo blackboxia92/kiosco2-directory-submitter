@@ -24,6 +24,12 @@ No abre el navegador, no crea un trabajo, no envía Telegram y no contacta ning�
 directorio. Devuelve los destinos y enlaces que usaría un envío para poder
 revisarlos antes de lanzar incluso una simulación.
 
+`POST /audit` realiza el control completo contra los formularios vigentes: exige
+que existan los campos, que el texto entre en sus límites, que la categoría tenga
+una opción compatible y que esté disponible el botón de envío. No rellena texto,
+no pulsa Submit, no crea un trabajo ni envía Telegram. `POST /jobs` ejecuta esa
+misma auditoría y rechaza el lote completo si algún destino no es compatible.
+
 Los selectores fueron comprobados el 25-09-2026. Los directorios son servicios
 externos y pueden cambiar el DOM o sus condiciones sin aviso. El worker usa
 IDs/nombres de campo, guarda una captura por intento y aísla cada fallo.
@@ -46,8 +52,9 @@ IDs/nombres de campo, guarda una captura por intento y aísla cada fallo.
   SQLite junto con el error, URL observada y captura disponible.
 - Esta primera ruta es sólo para `product_type: "ai_tool"`. Una empresa de
   servicios o un SaaS general se rechaza antes de abrir formularios de IA.
-- Si una categoría requerida no tiene coincidencia, el directorio se marca como
-  error; el sistema no elige una categoría aproximada para poder continuar.
+- Si una categoría requerida no tiene coincidencia, la auditoría rechaza el lote
+  antes de abrir una simulación o un envío; el sistema no elige una categoría
+  aproximada para poder continuar.
 
 Utiliza este servicio únicamente para productos que representes y en
 directorios cuyas condiciones permitan el envío automatizado.

@@ -825,6 +825,99 @@ async def classify_submission(
     return "Error", "No se detecto POST, navegacion ni confirmacion visible", last_status
 
 
+async def audit_directory(
+    browser: Browser, spec: DirectorySpec, payload: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Comprueba el formulario actual sin enviar ni registrar un trabajo."""
+    context = await browser.new_context(locale="en-US", viewport={"width": 1440, "height": 1100})
+    page = await context.new_page()
+    page.set_default_timeout(settings.navigation_timeout_ms)
+    checks: List[str] = []
+    try:
+        await page.goto(spec.url, wait_until="domcontentloaded")
+        await dismiss_common_overlays(page)
+
+        for field_spec in spec.text_fields:
+            locator = page.locator(field_spec.selector).first
+            if await locator.count() == 0:
+                if field_spec.required:
+                    raise RuntimeError(f"Campo requerido no encontrado: {field_spec.selector}")
+                checks.append(f"Campo opcional ausente: {field_spec.selector}")
+                continue
+            value = payload_value(payload, field_spec.source)
+            if field_spec.required and not value:
+                raise RuntimeError(f"Valor requerido vacio: {field_spec.source}")
+            max_length = await locator.get_attribute("maxlength")
+            if max_length and max_length.isdigit() and len(value) > int(max_length):
+                raise RuntimeError(
+                    f"{field_spec.source} supera el limite de {max_length} caracteres en {spec.name}"
+                )
+            checks.append(f"Campo listo: {field_spec.source}")
+
+        for field_spec in spec.select_fields:
+            # Falla si no existe una equivalencia exacta. No se envia el form:
+            # solo se valida la categoria disponible hoy.
+            await select_best_option(page, field_spec, payload)
+            checks.append(f"Categoria compatible: {field_spec.source}")
+
+        submit_button = page.locator(spec.submit_selector).first
+        if await submit_button.count() == 0:
+            raise RuntimeError(f"Boton de envio no encontrado: {spec.submit_selector}")
+
+        captcha = await detect_captcha(page)
+        if captcha:
+            raise RuntimeError(f"Requiere {captcha.kind}; se deriva a revision manual")
+
+        return {
+            "directory": spec.name,
+            "form_url": spec.url,
+            "status": "ready",
+            "checks": checks,
+            "detail": "Formulario compatible; no se rellenaron ni enviaron datos",
+        }
+    except Exception as exc:  # noqa: BLE001 - cada directorio se audita aislado
+        return {
+            "directory": spec.name,
+            "form_url": spec.url,
+            "status": "blocked",
+            "checks": checks,
+            "detail": f"{type(exc).__name__}: {exc}",
+        }
+    finally:
+        with suppress(PlaywrightError):
+            await context.close()
+
+
+async def audit_submission(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Audita todos los destinos antes de crear un lote ejecutable."""
+    directories = eligible_directories(payload)
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(
+            headless=settings.headless,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        try:
+            results = [await audit_directory(browser, spec, payload) for spec in directories]
+        finally:
+            await browser.close()
+    blocked = [item for item in results if item["status"] != "ready"]
+    return {
+        "mode": "form_audit",
+        "product_name": payload["product_name"],
+        "directories": results,
+        "ready_count": len(results) - len(blocked),
+        "blocked_count": len(blocked),
+        "ready_to_queue": not blocked,
+        "guarantees": {
+            "no_text_filled": True,
+            "no_submit_click": True,
+            "no_job_created": True,
+            "no_telegram_notification": True,
+            "no_external_submission": True,
+        },
+    }
+
+
 async def submit_to_directory(
     browser: Browser,
     spec: DirectorySpec,
@@ -1276,6 +1369,15 @@ async def create_job(
 ) -> JobAccepted:
     """Acepta una compra/webhook una vez, incluso ante reintentos HTTP del emisor."""
     require_supported_product_type(payload)
+    audit = await audit_submission(payload.model_dump(mode="json"))
+    if not audit["ready_to_queue"]:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "El lote no se creo: la auditoria encontro destinos incompatibles.",
+                "audit": audit,
+            },
+        )
     try:
         job_id, replayed = store.create_or_get(
             payload.model_dump(mode="json"),
@@ -1321,6 +1423,13 @@ async def preflight(payload: SubmissionPayload) -> Dict[str, Any]:
             "no_external_submission": True,
         },
     }
+
+
+@app.post("/audit", dependencies=[Depends(require_api_key)])
+async def audit(payload: SubmissionPayload) -> Dict[str, Any]:
+    """Inspecciona formularios actuales antes de una simulacion o envio real."""
+    require_supported_product_type(payload)
+    return await audit_submission(payload.model_dump(mode="json"))
 
 
 @app.get("/jobs/{job_id}", dependencies=[Depends(require_api_key)])

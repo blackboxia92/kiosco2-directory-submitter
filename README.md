@@ -33,6 +33,10 @@ IDs/nombres de campo, guarda una captura por intento y aísla cada fallo.
   mismo `job_id`; así un webhook de pago o un doble clic no genera otro lote.
 - Si un directorio falla antes del clic final, cada intento queda guardado en
   SQLite junto con el error, URL observada y captura disponible.
+- Esta primera ruta es sólo para `product_type: "ai_tool"`. Una empresa de
+  servicios o un SaaS general se rechaza antes de abrir formularios de IA.
+- Si una categoría requerida no tiene coincidencia, el directorio se marca como
+  error; el sistema no elige una categoría aproximada para poder continuar.
 
 Utiliza este servicio únicamente para productos que representes y en
 directorios cuyas condiciones permitan el envío automatizado.
@@ -83,6 +87,15 @@ curl -H "X-API-Key: un_valor_largo_y_aleatorio" \
 
 Después de revisar las capturas de la simulación, cambia `DRY_RUN=false` y
 reinicia el contenedor para habilitar envíos reales.
+
+El payload puede declarar el tipo de producto. La ruta actual sólo acepta:
+
+```json
+{ "product_type": "ai_tool" }
+```
+
+Los valores `saas` y `service` quedan reservados para las rutas de directorios
+compatibles que se incorporarán después de su validación.
 
 ## CLI sin servidor
 

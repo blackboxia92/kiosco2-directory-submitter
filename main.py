@@ -104,6 +104,9 @@ settings.database_path.parent.mkdir(parents=True, exist_ok=True)
 settings.artifact_dir.mkdir(parents=True, exist_ok=True)
 
 
+ProductType = Literal["ai_tool", "saas", "service"]
+
+
 class SubmissionPayload(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="ignore")
 
@@ -114,6 +117,7 @@ class SubmissionPayload(BaseModel):
     category: str = Field(min_length=2, max_length=200)
     contact_email: EmailStr
     telegram_chat_id: str = Field(default="", validate_default=True)
+    product_type: ProductType = "ai_tool"
 
     # Opcionales: mejoran algunos formularios sin cambiar el contrato minimo.
     pricing_model: str = Field(default="Freemium", max_length=80)
@@ -176,6 +180,7 @@ class SelectField:
     source: str
     required: bool = True
     preferred_fallbacks: tuple[str, ...] = ()
+    allow_fallback: bool = False
 
 
 @dataclass(frozen=True)
@@ -188,6 +193,7 @@ class DirectorySpec:
     pre_click_selectors: tuple[str, ...] = ()
     form_selector: str = "form"
     manual_review: bool = True
+    accepted_product_types: tuple[ProductType, ...] = ("ai_tool",)
 
 
 # Formularios comprobados el 25-09-2026. Se usan IDs/names estables y no
@@ -279,6 +285,13 @@ def utc_now() -> str:
 def slugify(value: str) -> str:
     value = value.encode("ascii", "ignore").decode("ascii")
     return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-") or "directory"
+
+
+def eligible_directories(payload: Dict[str, Any]) -> tuple[DirectorySpec, ...]:
+    product_type = payload.get("product_type", "ai_tool")
+    return tuple(
+        spec for spec in DIRECTORIES if product_type in spec.accepted_product_types
+    )
 
 
 class JobStore:
@@ -646,7 +659,7 @@ async def select_best_option(page: Page, field_spec: SelectField, payload: Dict[
 
     best = max(candidates, key=score)
     if score(best) == (0, 0):
-        for preferred in (*field_spec.preferred_fallbacks, "Other", "General"):
+        for preferred in field_spec.preferred_fallbacks:
             match = next(
                 (option for option in candidates if preferred.lower() in option["label"].lower()),
                 None,
@@ -654,6 +667,15 @@ async def select_best_option(page: Page, field_spec: SelectField, payload: Dict[
             if match:
                 best = match
                 break
+        else:
+            if field_spec.allow_fallback:
+                best = candidates[0]
+            elif field_spec.required:
+                raise RuntimeError(
+                    f"No existe una categoria compatible para '{requested}' en {field_spec.selector}"
+                )
+            else:
+                return
     await locator.select_option(value=best["value"])
 
 
@@ -1092,6 +1114,9 @@ async def process_submission(
     existing_directories = (existing_report or {}).get("directories") or []
     results = [DirectoryResult(**item) for item in existing_directories]
     finished_names = {result.directory for result in results}
+    directories = eligible_directories(payload)
+    if not directories:
+        raise RuntimeError("No hay directorios compatibles para este tipo de producto")
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
@@ -1099,7 +1124,7 @@ async def process_submission(
             args=["--no-sandbox", "--disable-dev-shm-usage"],
         )
         try:
-            for spec in DIRECTORIES:
+            for spec in directories:
                 if spec.name in finished_names:
                     continue
                 result = await submit_to_directory(
@@ -1256,6 +1281,14 @@ async def create_job(
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> JobAccepted:
     """Acepta una compra/webhook una vez, incluso ante reintentos HTTP del emisor."""
+    if payload.product_type != "ai_tool":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "La ruta actual solo admite herramientas de IA. "
+                "Las campañas SaaS y de servicios se habilitaran con sus directorios compatibles."
+            ),
+        )
     try:
         job_id, replayed = store.create_or_get(
             payload.model_dump(mode="json"),

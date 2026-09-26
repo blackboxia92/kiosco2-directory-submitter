@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import hashlib
 import io
 import json
 import os
@@ -135,6 +136,7 @@ class JobAccepted(BaseModel):
     status: str
     status_url: str
     dry_run: bool
+    idempotent_replay: bool = False
 
 
 DirectoryStatus = Literal[
@@ -304,16 +306,145 @@ class JobStore:
                 )
                 """
             )
+            # Migracion compatible con bases ya creadas en el volumen persistente.
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(jobs)").fetchall()
+            }
+            if "idempotency_key" not in columns:
+                connection.execute("ALTER TABLE jobs ADD COLUMN idempotency_key TEXT")
+            if "request_fingerprint" not in columns:
+                connection.execute("ALTER TABLE jobs ADD COLUMN request_fingerprint TEXT")
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotency_key
+                ON jobs(idempotency_key)
+                WHERE idempotency_key IS NOT NULL
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_request_fingerprint
+                ON jobs(request_fingerprint)
+                WHERE status IN ('queued', 'running')
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS directory_attempts (
+                    job_id TEXT NOT NULL,
+                    directory TEXT NOT NULL,
+                    attempt INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    form_url TEXT NOT NULL,
+                    confirmation_url TEXT,
+                    http_status INTEGER,
+                    screenshot_path TEXT,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT NOT NULL,
+                    PRIMARY KEY (job_id, directory, attempt),
+                    FOREIGN KEY (job_id) REFERENCES jobs(id)
+                )
+                """
+            )
 
-    def create(self, payload: Dict[str, Any]) -> str:
+    @staticmethod
+    def _request_fingerprint(payload: Dict[str, Any]) -> str:
+        canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def create_or_get(
+        self, payload: Dict[str, Any], idempotency_key: Optional[str]
+    ) -> tuple[str, bool]:
+        if idempotency_key and len(idempotency_key) > 128:
+            raise ValueError("Idempotency-Key no puede superar 128 caracteres")
         job_id = uuid4().hex
         now = utc_now()
+        fingerprint = self._request_fingerprint(payload)
+        with self._lock, self._connect() as connection:
+            if idempotency_key:
+                existing = connection.execute(
+                    "SELECT id FROM jobs WHERE idempotency_key = ?", (idempotency_key,)
+                ).fetchone()
+                if existing:
+                    return existing["id"], True
+            else:
+                existing = connection.execute(
+                    """
+                    SELECT id FROM jobs
+                    WHERE request_fingerprint = ? AND status IN ('queued', 'running')
+                    """,
+                    (fingerprint,),
+                ).fetchone()
+                if existing:
+                    return existing["id"], True
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO jobs (
+                        id, status, payload_json, result_json, error, created_at, updated_at,
+                        idempotency_key, request_fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        job_id,
+                        "queued",
+                        json.dumps(payload, ensure_ascii=False),
+                        None,
+                        None,
+                        now,
+                        now,
+                        idempotency_key,
+                        fingerprint,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # Cubre dos POST simultaneos con la misma clave o carga activa.
+                query = (
+                    "SELECT id FROM jobs WHERE idempotency_key = ?"
+                    if idempotency_key
+                    else "SELECT id FROM jobs WHERE request_fingerprint = ? AND status IN ('queued', 'running')"
+                )
+                value = idempotency_key or fingerprint
+                existing = connection.execute(query, (value,)).fetchone()
+                if existing:
+                    return existing["id"], True
+                raise
+        return job_id, False
+
+    def record_attempt(self, job_id: str, result: DirectoryResult) -> None:
+        values = asdict(result)
         with self._lock, self._connect() as connection:
             connection.execute(
-                "INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (job_id, "queued", json.dumps(payload, ensure_ascii=False), None, None, now, now),
+                """
+                INSERT INTO directory_attempts (
+                    job_id, directory, attempt, status, detail, form_url, confirmation_url,
+                    http_status, screenshot_path, started_at, finished_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(job_id, directory, attempt) DO UPDATE SET
+                    status = excluded.status,
+                    detail = excluded.detail,
+                    confirmation_url = excluded.confirmation_url,
+                    http_status = excluded.http_status,
+                    screenshot_path = excluded.screenshot_path,
+                    started_at = excluded.started_at,
+                    finished_at = excluded.finished_at
+                """,
+                (
+                    job_id,
+                    values["directory"],
+                    values["attempt"],
+                    values["status"],
+                    values["detail"],
+                    values["form_url"],
+                    values["confirmation_url"],
+                    values["http_status"],
+                    values["screenshot_path"],
+                    values["started_at"],
+                    values["finished_at"],
+                ),
             )
-        return job_id
 
     def update(
         self,
@@ -344,6 +475,15 @@ class JobStore:
     def get(self, job_id: str) -> Optional[Dict[str, Any]]:
         with self._lock, self._connect() as connection:
             row = connection.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            attempts = connection.execute(
+                """
+                SELECT directory, attempt, status, detail, form_url, confirmation_url,
+                       http_status, screenshot_path, started_at, finished_at
+                FROM directory_attempts WHERE job_id = ?
+                ORDER BY directory, attempt
+                """,
+                (job_id,),
+            ).fetchall()
         if row is None:
             return None
         return {
@@ -354,6 +494,7 @@ class JobStore:
             "error": row["error"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+            "attempts": [dict(attempt) for attempt in attempts],
         }
 
     def recoverable_ids(self) -> List[str]:
@@ -684,6 +825,7 @@ async def submit_to_directory(
     spec: DirectorySpec,
     payload: Dict[str, Any],
     job_artifact_dir: Path,
+    on_retryable_failure: Optional[Callable[[DirectoryResult], Awaitable[None]]] = None,
 ) -> DirectoryResult:
     solver = TwoCaptchaClient(settings.twocaptcha_api_key, settings.captcha_timeout_seconds)
     last_error = ""
@@ -814,6 +956,20 @@ async def submit_to_directory(
                     started_at=started_at,
                     finished_at=utc_now(),
                 )
+            if on_retryable_failure:
+                await on_retryable_failure(
+                    DirectoryResult(
+                        directory=spec.name,
+                        form_url=spec.url,
+                        status="Error",
+                        detail=last_error,
+                        attempt=attempt,
+                        confirmation_url=page.url,
+                        screenshot_path=screenshot,
+                        started_at=started_at,
+                        finished_at=utc_now(),
+                    )
+                )
             await asyncio.sleep(attempt * 2)
         finally:
             with suppress(PlaywrightError):
@@ -839,15 +995,25 @@ def report_dict(
     telegram_error: str = "",
 ) -> Dict[str, Any]:
     processed = len(results)
-    successes = sum(result.status == "Enviado" for result in results)
-    failed_or_pending = processed - successes
+    submitted = sum(result.status == "Enviado" for result in results)
+    pending = sum(result.status == "Pendiente de aprobación" for result in results)
+    simulated = sum(result.status == "Simulado" for result in results)
+    skipped = sum(result.status == "Omitido" for result in results)
+    failed = sum(result.status == "Error" for result in results)
     return {
         "job_id": job_id,
         "product_name": payload["product_name"],
         "dry_run": settings.dry_run,
         "directories_processed": processed,
-        "successes": successes,
-        "failed_or_pending": failed_or_pending,
+        "successes": submitted,
+        "failed_or_pending": failed + pending + skipped,
+        "summary": {
+            "submitted": submitted,
+            "pending": pending,
+            "simulated": simulated,
+            "skipped": skipped,
+            "failed": failed,
+        },
         "directories": [asdict(result) for result in results],
         "telegram_sent": telegram_sent,
         "telegram_error": telegram_error,
@@ -882,13 +1048,21 @@ async def send_telegram_report(
     if not settings.telegram_bot_token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN no esta configurado")
     processed = len(results)
-    successes = sum(result.status == "Enviado" for result in results)
-    failed_or_pending = processed - successes
+    submitted = sum(result.status == "Enviado" for result in results)
+    pending = sum(result.status == "Pendiente de aprobación" for result in results)
+    simulated = sum(result.status == "Simulado" for result in results)
+    skipped = sum(result.status == "Omitido" for result in results)
+    failed = sum(result.status == "Error" for result in results)
+    mode = "SIMULACION" if settings.dry_run else "ENVIO REAL"
     summary = (
-        f"✅ Proceso de Envío Completado para {payload['product_name']}\n"
+        f"✅ Lote finalizado ({mode}) — {payload['product_name']}\n"
         f"- Directorios procesados: {processed}\n"
-        f"- Éxitos: {successes}\n"
-        f"- Fallidos/Pendientes: {failed_or_pending}"
+        f"- Enviados: {submitted}\n"
+        f"- Pendientes: {pending}\n"
+        f"- Simulados: {simulated}\n"
+        f"- Omitidos: {skipped}\n"
+        f"- Errores: {failed}\n"
+        "Adjunto: detalle y evidencias por directorio."
     )
     filename = f"directory-submissions-{slugify(payload['product_name'])}-{job_id[:8]}.csv"
     endpoint = (
@@ -927,7 +1101,14 @@ async def process_submission(
             for spec in DIRECTORIES:
                 if spec.name in finished_names:
                     continue
-                result = await submit_to_directory(browser, spec, payload, job_artifact_dir)
+                result = await submit_to_directory(
+                    browser,
+                    spec,
+                    payload,
+                    job_artifact_dir,
+                    on_retryable_failure=lambda attempt: persist_attempt(job_id, attempt),
+                )
+                store.record_attempt(job_id, result)
                 results.append(result)
                 partial = report_dict(job_id, payload, results)
                 if progress:
@@ -954,6 +1135,11 @@ async def process_submission(
 
 async def persist_progress(job_id: str, report: Dict[str, Any]) -> None:
     store.update(job_id, status="running", result=report)
+
+
+async def persist_attempt(job_id: str, result: DirectoryResult) -> None:
+    """Guarda cada fallo transitorio antes de que el worker lo reintente."""
+    store.record_attempt(job_id, result)
 
 
 async def job_worker() -> None:
@@ -1064,14 +1250,27 @@ async def jobs_status() -> Dict[str, Any]:
     status_code=202,
     dependencies=[Depends(require_api_key)],
 )
-async def create_job(payload: SubmissionPayload) -> JobAccepted:
-    job_id = store.create(payload.model_dump(mode="json"))
-    await job_queue.put(job_id)
+async def create_job(
+    payload: SubmissionPayload,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+) -> JobAccepted:
+    """Acepta una compra/webhook una vez, incluso ante reintentos HTTP del emisor."""
+    try:
+        job_id, replayed = store.create_or_get(
+            payload.model_dump(mode="json"),
+            idempotency_key.strip() if idempotency_key else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not replayed:
+        await job_queue.put(job_id)
+    current_status = store.get(job_id)["status"] if replayed else "queued"
     return JobAccepted(
         job_id=job_id,
-        status="queued",
+        status=current_status,
         status_url=f"/jobs/{job_id}",
         dry_run=settings.dry_run,
+        idempotent_replay=replayed,
     )
 
 

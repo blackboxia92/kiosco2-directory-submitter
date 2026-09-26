@@ -29,6 +29,10 @@ IDs/nombres de campo, guarda una captura por intento y aísla cada fallo.
 - Si 2Captcha no responde dentro de 60 segundos, el resultado es `Omitido`.
 - La cola SQLite conserva jobs pendientes y resultados parciales después de un
   reinicio. Ejecutar un solo proceso Uvicorn para no duplicar workers.
+- Los reintentos HTTP con el mismo encabezado `Idempotency-Key` devuelven el
+  mismo `job_id`; así un webhook de pago o un doble clic no genera otro lote.
+- Si un directorio falla antes del clic final, cada intento queda guardado en
+  SQLite junto con el error, URL observada y captura disponible.
 
 Utiliza este servicio únicamente para productos que representes y en
 directorios cuyas condiciones permitan el envío automatizado.
@@ -66,6 +70,7 @@ directorios cuyas condiciones permitan el envío automatizado.
    curl -X POST http://localhost:8000/submit \
      -H "Content-Type: application/json" \
      -H "X-API-Key: un_valor_largo_y_aleatorio" \
+     -H "Idempotency-Key: payment-12345" \
      --data-binary @payload.test.json
    ```
 
@@ -130,6 +135,11 @@ Estados de directorio:
 - `Simulado`: formulario preparado bajo `DRY_RUN`.
 
 Telegram recibe un CSV UTF-8 con URLs de formulario/confirmación, estado,
-detalle, HTTP observado, intento y ruta de la captura. Como pidió el contrato,
-`Éxitos` cuenta solo `Enviado`; pendientes, errores, omitidos y simulados se
-agrupan en `Fallidos/Pendientes`.
+detalle, HTTP observado, intento y ruta de la captura. `Éxitos` cuenta solo
+`Enviado`; el resumen conserva por separado pendientes, simulados, omitidos y
+errores.
+
+El mensaje final separa enviados, pendientes, simulados, omitidos y errores.
+El detalle completo del lote puede consultarse con `GET /jobs/{job_id}`: incluye
+`attempts`, el registro de fallos transitorios y el resultado final por
+directorio.

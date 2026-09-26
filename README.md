@@ -17,6 +17,13 @@ verified again. Directories that require a login, payment, CAPTCHA, email
 verification, or reciprocal link are handled manually and are never run by the
 automated worker.
 
+## Vista previa sin interacción externa
+
+`POST /preflight` acepta el mismo JSON que `POST /jobs` y requiere `X-API-Key`.
+No abre el navegador, no crea un trabajo, no envía Telegram y no contacta ningún
+directorio. Devuelve los destinos y enlaces que usaría un envío para poder
+revisarlos antes de lanzar incluso una simulación.
+
 Los selectores fueron comprobados el 25-09-2026. Los directorios son servicios
 externos y pueden cambiar el DOM o sus condiciones sin aviso. El worker usa
 IDs/nombres de campo, guarda una captura por intento y aísla cada fallo.

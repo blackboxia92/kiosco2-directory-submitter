@@ -1202,6 +1202,18 @@ async def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> No
         raise HTTPException(status_code=401, detail="X-API-Key invalida")
 
 
+def require_supported_product_type(payload: SubmissionPayload) -> None:
+    """Mantiene el alcance de esta beta en herramientas de IA publicas."""
+    if payload.product_type != "ai_tool":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "La ruta actual solo admite herramientas de IA. "
+                "Las campañas SaaS y de servicios se habilitaran con sus directorios compatibles."
+            ),
+        )
+
+
 @app.get("/health")
 async def health(response: Response) -> Dict[str, Any]:
     sqlite_ok = False
@@ -1263,14 +1275,7 @@ async def create_job(
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> JobAccepted:
     """Acepta una compra/webhook una vez, incluso ante reintentos HTTP del emisor."""
-    if payload.product_type != "ai_tool":
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "La ruta actual solo admite herramientas de IA. "
-                "Las campañas SaaS y de servicios se habilitaran con sus directorios compatibles."
-            ),
-        )
+    require_supported_product_type(payload)
     try:
         job_id, replayed = store.create_or_get(
             payload.model_dump(mode="json"),
@@ -1288,6 +1293,34 @@ async def create_job(
         dry_run=settings.dry_run,
         idempotent_replay=replayed,
     )
+
+
+@app.post("/preflight", dependencies=[Depends(require_api_key)])
+async def preflight(payload: SubmissionPayload) -> Dict[str, Any]:
+    """Muestra el lote previsto sin abrir sitios, encolar trabajos ni notificar."""
+    require_supported_product_type(payload)
+    directories = eligible_directories(payload.model_dump(mode="json"))
+    return {
+        "mode": "preview_only",
+        "dry_run": settings.dry_run,
+        "product_name": payload.product_name,
+        "product_type": payload.product_type,
+        "directories_count": len(directories),
+        "directories": [
+            {
+                "name": spec.name,
+                "form_url": spec.url,
+                "manual_review": spec.manual_review,
+            }
+            for spec in directories
+        ],
+        "guarantees": {
+            "no_browser": True,
+            "no_job_created": True,
+            "no_telegram_notification": True,
+            "no_external_submission": True,
+        },
+    }
 
 
 @app.get("/jobs/{job_id}", dependencies=[Depends(require_api_key)])

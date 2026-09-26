@@ -37,7 +37,7 @@ import httpx
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, HttpUrl, field_validator
 from playwright.async_api import (
     Browser,
@@ -71,6 +71,7 @@ class Settings:
     twocaptcha_api_key: str
     webhook_api_key: str
     dry_run: bool
+    service_paused: bool
     headless: bool
     database_path: Path
     artifact_dir: Path
@@ -89,6 +90,9 @@ def load_settings() -> Settings:
             "WEBHOOK_SECRET", os.getenv("WEBHOOK_API_KEY", "")
         ).strip(),
         dry_run=env_bool("DRY_RUN", True),
+        # Fail closed: a deployment without an explicit operational decision
+        # must never resume browser automation or CAPTCHA spending by accident.
+        service_paused=env_bool("SERVICE_PAUSED", True),
         headless=env_bool("HEADLESS", True),
         database_path=resolve_path(os.getenv("DATABASE_PATH", "data/jobs.sqlite3")),
         artifact_dir=resolve_path(os.getenv("ARTIFACT_DIR", "data/artifacts")),
@@ -1269,6 +1273,12 @@ async def job_worker() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    if settings.service_paused:
+        # Keep SQLite untouched, including queued/running jobs.  In particular,
+        # do not recover jobs into memory and do not start a Playwright worker.
+        yield
+        return
+
     for job_id in store.recoverable_ids():
         store.update(job_id, status="queued")
         await job_queue.put(job_id)
@@ -1286,6 +1296,32 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
+PAUSED_OPERATION_PATHS = {"/jobs", "/submit", "/preflight", "/audit"}
+
+
+@app.middleware("http")
+async def pause_operational_routes(request, call_next):
+    """Reject operational traffic before body validation or endpoint execution."""
+    if settings.service_paused and (
+        request.url.path in PAUSED_OPERATION_PATHS
+        or request.url.path.startswith("/jobs/")
+    ):
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Kiosco #2 temporalmente en pausa"},
+        )
+    return await call_next(request)
+
+
+def raise_if_service_paused() -> None:
+    """Hard operational stop for every route that can inspect or process forms."""
+    if settings.service_paused:
+        raise HTTPException(
+            status_code=503,
+            detail="Kiosco #2 temporalmente en pausa",
+        )
 
 
 async def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
@@ -1307,8 +1343,22 @@ def require_supported_product_type(payload: SubmissionPayload) -> None:
         )
 
 
+@app.get("/")
+async def root() -> Dict[str, str]:
+    return {"message": "Kiosco #2 temporalmente en pausa"}
+
+
 @app.get("/health")
 async def health(response: Response) -> Dict[str, Any]:
+    if settings.service_paused:
+        return {
+            "status": "paused",
+            "queue_size": 0,
+            "dry_run": settings.dry_run,
+            "service_paused": True,
+            "checks": {"fastapi": True, "sqlite": True, "playwright_chromium": "not_started"},
+        }
+
     sqlite_ok = False
     playwright_ok = False
 
@@ -1332,6 +1382,7 @@ async def health(response: Response) -> Dict[str, Any]:
         "status": "ok" if ready else "degraded",
         "queue_size": job_queue.qsize(),
         "dry_run": settings.dry_run,
+        "service_paused": False,
         "directories": len(DIRECTORIES),
         "checks": {
             "fastapi": True,
@@ -1344,6 +1395,7 @@ async def health(response: Response) -> Dict[str, Any]:
 @app.get("/jobs")
 async def jobs_status() -> Dict[str, Any]:
     """Public, non-sensitive status endpoint used by deployment smoke tests."""
+    raise_if_service_paused()
     return {
         "status": "ok",
         "queue_size": job_queue.qsize(),
@@ -1368,6 +1420,7 @@ async def create_job(
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> JobAccepted:
     """Acepta una compra/webhook una vez, incluso ante reintentos HTTP del emisor."""
+    raise_if_service_paused()
     require_supported_product_type(payload)
     audit = await audit_submission(payload.model_dump(mode="json"))
     if not audit["ready_to_queue"]:
@@ -1400,6 +1453,7 @@ async def create_job(
 @app.post("/preflight", dependencies=[Depends(require_api_key)])
 async def preflight(payload: SubmissionPayload) -> Dict[str, Any]:
     """Muestra el lote previsto sin abrir sitios, encolar trabajos ni notificar."""
+    raise_if_service_paused()
     require_supported_product_type(payload)
     directories = eligible_directories(payload.model_dump(mode="json"))
     return {
@@ -1428,12 +1482,14 @@ async def preflight(payload: SubmissionPayload) -> Dict[str, Any]:
 @app.post("/audit", dependencies=[Depends(require_api_key)])
 async def audit(payload: SubmissionPayload) -> Dict[str, Any]:
     """Inspecciona formularios actuales antes de una simulacion o envio real."""
+    raise_if_service_paused()
     require_supported_product_type(payload)
     return await audit_submission(payload.model_dump(mode="json"))
 
 
 @app.get("/jobs/{job_id}", dependencies=[Depends(require_api_key)])
 async def get_job(job_id: str) -> Dict[str, Any]:
+    raise_if_service_paused()
     job = store.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job no encontrado")
@@ -1443,6 +1499,7 @@ async def get_job(job_id: str) -> Dict[str, Any]:
 @app.get("/jobs/{job_id}/artifacts/{artifact_name}", dependencies=[Depends(require_api_key)])
 async def get_job_artifact(job_id: str, artifact_name: str) -> FileResponse:
     """Entrega una captura del job sin permitir salir de su carpeta de evidencias."""
+    raise_if_service_paused()
     job_dir = (settings.artifact_dir / job_id).resolve()
     artifact_path = (job_dir / artifact_name).resolve()
     if not artifact_path.is_relative_to(job_dir) or not artifact_path.is_file():
@@ -1466,6 +1523,10 @@ def main() -> int:
     if args.command == "serve":
         uvicorn.run(app, host=args.host, port=args.port)
         return 0
+
+    if settings.service_paused:
+        print("Kiosco #2 temporalmente en pausa", file=sys.stderr)
+        return 3
 
     try:
         raw_payload = json.loads(Path(args.payload_file).read_text(encoding="utf-8"))

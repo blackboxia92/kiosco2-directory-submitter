@@ -36,6 +36,15 @@ IDs/nombres de campo, guarda una captura por intento y aísla cada fallo.
 
 ## Comportamiento seguro
 
+### Pausa operativa
+
+`SERVICE_PAUSED=true` es una parada reversible y estricta: no recupera jobs de
+SQLite, no inicia el worker, no abre Playwright y no contacta 2Captcha. Las
+rutas `/jobs`, `/submit`, `/preflight`, `/audit` y la consulta de trabajos
+devuelven HTTP 503; `/` informa que el servicio está en pausa y `/health`
+confirma el estado. La base de datos y `/app/data` nunca se modifican. Para
+reactivar, definir explícitamente `SERVICE_PAUSED=false` y desplegar de nuevo.
+
 - `DRY_RUN=true` por defecto: abre y rellena los cinco formularios, toma
   capturas y genera el reporte, pero no pulsa el botón final.
 - Un formulario puede reintentarse antes de pulsar Submit. Después del clic no

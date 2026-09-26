@@ -37,6 +37,7 @@ import httpx
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, HttpUrl, field_validator
 from playwright.async_api import (
     Browser,
@@ -1280,6 +1281,16 @@ async def get_job(job_id: str) -> Dict[str, Any]:
     if not job:
         raise HTTPException(status_code=404, detail="Job no encontrado")
     return job
+
+
+@app.get("/jobs/{job_id}/artifacts/{artifact_name}", dependencies=[Depends(require_api_key)])
+async def get_job_artifact(job_id: str, artifact_name: str) -> FileResponse:
+    """Entrega una captura del job sin permitir salir de su carpeta de evidencias."""
+    job_dir = (settings.artifact_dir / job_id).resolve()
+    artifact_path = (job_dir / artifact_name).resolve()
+    if not artifact_path.is_relative_to(job_dir) or not artifact_path.is_file():
+        raise HTTPException(status_code=404, detail="Evidencia no encontrada")
+    return FileResponse(artifact_path, media_type="image/png", filename=artifact_path.name)
 
 
 def parse_args() -> argparse.Namespace:

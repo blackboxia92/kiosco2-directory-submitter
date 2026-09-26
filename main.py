@@ -117,7 +117,7 @@ class SubmissionPayload(BaseModel):
     category: str = Field(min_length=2, max_length=200)
     contact_email: EmailStr
     telegram_chat_id: str = Field(default="", validate_default=True)
-    product_type: ProductType = "ai_tool"
+    product_type: ProductType
 
     # Opcionales: mejoran algunos formularios sin cambiar el contrato minimo.
     pricing_model: str = Field(default="Freemium", max_length=80)

@@ -88,7 +88,7 @@ curl -H "X-API-Key: un_valor_largo_y_aleatorio" \
 Después de revisar las capturas de la simulación, cambia `DRY_RUN=false` y
 reinicia el contenedor para habilitar envíos reales.
 
-El payload puede declarar el tipo de producto. La ruta actual sólo acepta:
+El payload debe declarar el tipo de producto. La ruta actual sólo acepta:
 
 ```json
 { "product_type": "ai_tool" }

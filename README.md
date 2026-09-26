@@ -8,10 +8,14 @@ login, paywalls ni challenges administrados sin un `sitekey` reutilizable.
 ## Directorios incluidos
 
 1. Come AI — `https://www.iatool.online/submit-tool/`
-2. The Next AI — `https://www.thenextai.com/submit-ai-tool/`
-3. ListAI.cc — `https://listai.cc/submit`
-4. DayToDay.ai — `https://daytoday.ai/submit`
-5. AI Tools Directory — `https://aitoolsdirectory.site/submit.html`
+2. ListAI.cc — `https://listai.cc/submit`
+3. DayToDay.ai — `https://daytoday.ai/submit`
+4. AI Tools Directory — `https://aitoolsdirectory.site/submit.html`
+
+The Next AI is intentionally excluded until its current submission flow is
+verified again. Directories that require a login, payment, CAPTCHA, email
+verification, or reciprocal link are handled manually and are never run by the
+automated worker.
 
 Los selectores fueron comprobados el 25-09-2026. Los directorios son servicios
 externos y pueden cambiar el DOM o sus condiciones sin aviso. El worker usa

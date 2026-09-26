@@ -196,8 +196,10 @@ class DirectorySpec:
     accepted_product_types: tuple[ProductType, ...] = ("ai_tool",)
 
 
-# Formularios comprobados el 25-09-2026. Se usan IDs/names estables y no
+# Formularios comprobados en una prueba seca. Se usan IDs/names estables y no
 # selectores nth-child. Si un DOM cambia, el directorio falla de forma aislada.
+# Los directorios que requieren cuenta, pago, CAPTCHA o una nueva comprobacion
+# visual no pertenecen a este worker.
 DIRECTORIES: tuple[DirectorySpec, ...] = (
     DirectorySpec(
         name="Come AI",
@@ -212,26 +214,6 @@ DIRECTORIES: tuple[DirectorySpec, ...] = (
         select_fields=(),
         submit_selector='button[type="submit"]',
         form_selector="form.submit-form",
-    ),
-    DirectorySpec(
-        name="The Next AI",
-        url="https://www.thenextai.com/submit-ai-tool/",
-        text_fields=(
-            TextField("#f-name", "product_name"),
-            TextField("#f-url", "website_url"),
-            TextField("#f-short", "tagline"),
-            TextField("#f-desc", "description"),
-            TextField("#f-logo", "logo_url", required=False),
-            TextField("#f-email", "contact_email"),
-            TextField("#f-tags", "tags", required=False),
-        ),
-        select_fields=(
-            SelectField("#f-cat", "category"),
-            SelectField("#f-pricing", "pricing_model", preferred_fallbacks=("Freemium", "Other")),
-        ),
-        pre_click_selectors=("#toggleFree",),
-        submit_selector="#submitBtn",
-        form_selector="#submitBtn",
     ),
     DirectorySpec(
         name="ListAI.cc",
